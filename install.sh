@@ -40,7 +40,7 @@ echo "Directories created."
 
 # --- Compile Source Code ---
 echo "Compiling simple-proxy..."
-gcc main.c -o simple-proxy -lconfig -pthread -lresolv -std=c11
+gcc main.c -o simple-proxy -lconfig -lresolv -pthread -std=gnu1111
 if [ $? -ne 0 ]; then
   echo "Compilation failed. Exiting."
   exit 1
