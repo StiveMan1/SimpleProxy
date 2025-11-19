@@ -1,65 +1,88 @@
 #!/bin/bash
+set -euo pipefail
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+echo "=== SimpleProxy3 Installer ==="
 
-# --- Preamble ---
-echo "Starting simple-proxy installation..."
-
-# Check for root privileges
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root (sudo)."
-  exit 1
+# --- Root check ---
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Please run this installer as root (sudo)."
+    exit 1
 fi
 
-# --- Install Dependencies ---
-echo "Installing dependencies..."
-if command -v apt &> /dev/null; then
-  # Debian/Ubuntu
-  apt update
-  apt install -y gcc libconfig-dev
-elif command -v yum &> /dev/null; then
-  # CentOS/RHEL
-  yum install -y gcc libconfig-devel
-elif command -v dnf &> /dev/null; then
-  # Fedora
-  dnf install -y gcc libconfig-devel
-elif command -v pacman &> /dev/null; then
-  # Arch Linux
-  pacman -Sy --noconfirm gcc libconfig
+# --- Detect package manager ---
+if command -v apt &>/dev/null; then
+    PM="apt"
+elif command -v pacman &>/dev/null; then
+    PM="pacman"
+elif command -v dnf &>/dev/null; then
+    PM="dnf"
+elif command -v yum &>/dev/null; then
+    PM="yum"
 else
-  echo "Unsupported package manager. Please install 'gcc' and 'libconfig-dev' (or equivalent) manually."
-  exit 1
+    echo "ERROR: Unsupported Linux distribution."
+    exit 1
 fi
+
+echo "Using package manager: $PM"
+
+# --- Install dependencies ---
+echo "Installing dependencies..."
+case "$PM" in
+  apt)
+    apt update
+    apt install -y cmake gcc libconfig-dev pkg-config
+    ;;
+  pacman)
+    pacman -Sy --noconfirm cmake gcc libconfig pkgconf
+    ;;
+  dnf|yum)
+    $PM install -y cmake gcc libconfig-devel pkgconf
+    ;;
+esac
+
 echo "Dependencies installed."
 
-# --- Create Directories ---
-echo "Creating necessary directories..."
-mkdir -p /etc/simple-proxy
-echo "Directories created."
+# --- Build using CMake ---
+BUILD_DIR="build"
 
-# --- Compile Source Code ---
-echo "Compiling simple-proxy..."
-gcc main.c -o simple-proxy -lconfig -pthread -std=c11
-if [ $? -ne 0 ]; then
-  echo "Compilation failed. Exiting."
-  exit 1
+echo "Creating build directory: $BUILD_DIR"
+rm -rf "$BUILD_DIR"
+mkdir "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+echo "Configuring CMake..."
+cmake -DCMAKE_BUILD_TYPE=Release ..
+
+echo "Building..."
+cmake --build . --config Release
+
+echo "Build successful."
+
+# --- Install binary and config ---
+echo "Installing with CMake..."
+cmake --install .  # installs to /usr/local by default
+
+# --- Install config directory ---
+if [[ ! -d /etc/simple-proxy ]]; then
+    echo "Creating /etc/simple-proxy..."
+    mkdir -p /etc/simple-proxy
 fi
-echo "Compilation successful."
 
-# --- Install Files ---
-echo "Copying files to system locations..."
-cp config.cfg /etc/simple-proxy/config.cfg
-cp simple-proxy /usr/bin/simple-proxy
-cp simple-proxy.service /etc/systemd/system/simple-proxy.service
-echo "Files copied."
+if [[ -f ../config.cfg ]]; then
+    echo "Copying config.cfg..."
+    cp ../config.cfg /etc/simple-proxy/config.cfg
+fi
 
-# --- Systemd Setup ---
-echo "Setting up systemd service..."
+# --- Install systemd service ---
+echo "Installing systemd service..."
+cp ../simple-proxy.service /etc/systemd/system/simple-proxy.service
+
 systemctl daemon-reload
 systemctl enable simple-proxy
-systemctl start simple-proxy
-echo "Systemd service enabled and started."
+systemctl restart simple-proxy
 
-echo "Installation complete. simple-proxy is running and will start on boot."
-echo "You can check its status with: systemctl status simple-proxy"
+echo "=== Installation Complete ==="
+echo "SimpleProxy3 is installed and running."
+echo "Binary: /usr/local/bin/SimpleProxy3"
+echo "Config: /etc/simple-proxy/config.cfg"
+echo "Service: systemctl status simple-proxy"
