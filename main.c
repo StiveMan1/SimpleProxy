@@ -1,243 +1,258 @@
-#include "config.h"
+#include <errno.h>
 
 #include "libconfig.h"
 
-#include <stdio.h>
-#include <netinet/in.h>
-#include <sys/ioctl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <poll.h>
+#include <sys/socket.h>
 #include <sys/epoll.h>
-#include <sys/syscall.h>
 #include <sys/types.h>
 
-#define packet_size 1024 * 1024
-char buffer[packet_size];
+#include <arpa/nameser.h>
+#include <arpa/inet.h>
+
+#include <netinet/in.h>
+
+#include <pthread.h>
+#include <string.h>
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <netdb.h>
+
+#include <stdlib.h>
+#include <stdio.h>
+
+#include <resolv.h>
+
+
+
+typedef struct proxy_client {
+    int32_t cli_s;
+    int32_t des_s;
+
+    struct proxy_client *next;
+    struct proxy_client *prev;
+} proxy_client;
+
+typedef struct {
+    proxy_client *head;
+    proxy_client *last;
+
+    int32_t count;
+} clients_list;
+
+typedef struct proxy_server {
+    clients_list clients;
+
+    int32_t socket;
+    int32_t epoll;
+
+    int32_t ai_family; // AF_INET
+    int32_t ai_socktype; // SOCK_STREAM
+    int32_t ai_protocol; // IPPROTO_TCP
+    int32_t ai_interface; // INADDR_ANY
+    int32_t port;
+
+    const char *des_server;
+    int32_t des_port;
+
+    pthread_t thread;
+    struct proxy_server *next;
+} proxy_server;
+
+typedef struct {
+    proxy_server *head;
+    proxy_server *last;
+} servers_list;
+
+
+#define MAX_PACKET (1024 * 1024)
 char *config_file = "/etc/simple-proxy/config.cfg";
 
-void parse_args(int argc, char **argv) {
-    for (int i = 0; i < argc; i++) {
-        if (argv[i][0] == '-' && strlen(argv[i]) == 2 && i + 1 < argc) {
-            switch (argv[i][1]) {
-                case 'f':
-                    config_file = argv[i + 1];
-                    break;
-            }
-        }
-    }
-}
-struct proxy_client *new_client(socket_t cli_socket, socket_t des_socket) {
-    struct proxy_client *cli = calloc(1, sizeof(struct proxy_client));
-    cli->cli_socket = cli_socket;
-    cli->des_socket = des_socket;
-    return cli;
+
+
+void proxy_clients_add(clients_list *clients, const int32_t cli_socket, const int32_t des_socket) {
+    proxy_client *cli = calloc(1, sizeof(proxy_client));
+    *cli = (proxy_client) {cli_socket, des_socket, NULL, NULL};
+
+    if (++clients->count != 1) clients->last->next = cli;
+    else clients->head = cli;
+
+    cli->prev = clients->last;
+    clients->last = cli;
 }
 
-void close_client(struct proxy_client *cli) {
-    if (cli == NULL) return;
+void proxy_clients_rem(clients_list *clients, proxy_client *cli) {
+    if (cli->prev) cli->prev->next = cli->next;
+    else clients->head = cli->next;
 
-    close(cli->cli_socket);
-    close(cli->des_socket);
+    if (cli->next) cli->next->prev = cli->prev;
+    else clients->last = cli->prev;
 
+    close(cli->cli_s);
+    close(cli->des_s);
+    --clients->count;
     free(cli);
 }
 
-void proxy_clients_resize(struct clients_list *res, size_t size) {
-    if (res->data == NULL && size) {
-        res->mx_size = size;
-        res->data = malloc(size * sizeof(struct proxy_client *));
-    } else if (res->mx_size < size) {
-        res->data = realloc(res->data, size * 2 * sizeof(struct proxy_client *));
-        res->mx_size = size * 2;
-    }
-    for (size_t i = size, l = res->size; i < l; i++) res->data[i] = NULL;
-    for (size_t i = res->size, l = size; i < l; i++) close_client(res->data[i]);
-    res->size = size;
-}
-
-void proxy_clients_add(struct clients_list *clients, struct proxy_client *cli) {
-    proxy_clients_resize(clients, clients->size + 1);
-    clients->data[clients->size - 1] = cli;
-}
-
-void proxy_clients_rem(struct clients_list *clients, struct proxy_client *cli) {
-    size_t pos = 0, size = clients->size;
-    for (; pos < size && cli != clients->data[pos]; pos++);
-    if (pos == size) return;
-
-    for (; pos < size - 1; pos++) clients->data[pos] = clients->data[pos + 1];
-    clients->data[size] = cli;
-    proxy_clients_resize(clients, size - 1);
-}
-
-struct proxy_client *proxy_clients_find(struct clients_list *clients, int fd) {
-    for (size_t pos = 0, size = clients->size; pos < size; pos++) {
-        if (clients->data[pos]->cli_socket == fd) return clients->data[pos];
-        if (clients->data[pos]->des_socket == fd) return clients->data[pos];
+proxy_client *proxy_clients_find(const clients_list *clients, const int fd) {
+    for (proxy_client *cli = clients->head; cli != NULL; cli = cli->next) {
+        if (cli->cli_s == fd || cli->des_s == fd) return cli;
     }
     return NULL;
 }
 
-void server_close(struct proxy_server *serv) {
-    if (serv->socket >= 0)
-        close(serv->socket);
-    if (serv->epoll >= 0)
-        close(serv->epoll);
 
-    serv->socket = -1;
-    serv->epoll = -1;
+int32_t destination_socket(const proxy_server *srv) {
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = srv->ai_family;
+    hints.ai_socktype = srv->ai_socktype;
+    hints.ai_protocol = srv->ai_protocol;
 
-    proxy_clients_resize(&serv->clients, 0);
+    if (getaddrinfo(srv->des_server, NULL, &hints, &res) != 0) return -1;
+    ((struct sockaddr_in *)res->ai_addr)->sin_port = htons(srv->des_port);
+
+    const int32_t sock = socket(srv->ai_family, srv->ai_socktype, srv->ai_protocol);
+    const int32_t conn = sock == -1? 0 : connect(sock, res->ai_addr, res->ai_addrlen);
+
+    freeaddrinfo(res);
+    if (conn != 0) close(sock);
+    return conn == 0 ? sock : -1;
 }
 
-int server_open(struct proxy_server *serv) {
-    serv->epoll = epoll_create(1);
-    serv->socket = socket(serv->config.domain, serv->config.service, serv->config.protocol);
-
-    int option = 1;
-    setsockopt(serv->socket, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
-
-    struct epoll_event ev = {EPOLLIN, {.fd = serv->socket}};
-    struct sockaddr_in server_address = {serv->config.domain, htons(serv->config.port),
-                                         {serv->config.interface}};
-
-    if (bind(serv->socket, (struct sockaddr *) &server_address, sizeof(server_address)) != 0) goto bad_end;
-    if ((listen(serv->socket, 128)) < 0) goto bad_end;
-    if (epoll_ctl(serv->epoll, EPOLL_CTL_ADD, serv->socket, &ev) == -1) goto bad_end;
-    return 0;
-
-    bad_end:
-    close(serv->socket);
-    serv->socket = -1;
-    return -1;
-}
-
-
-socket_t destination_socket(struct proxy_server *serv) {
-    socket_t sock = socket(serv->config.domain, serv->config.service, serv->config.protocol);
-
-    struct sockaddr_in server_address = {serv->config.domain, htons(serv->config.dest_port)};
-    inet_pton(serv->config.domain, serv->config.dest_server, &server_address.sin_addr);
-    int _con = connect(sock, (struct sockaddr *) &server_address, sizeof(server_address));
-    return (_con == 0) ? sock : -1;
-}
-
-ssize_t do_client(struct proxy_client *cli, socket_t fd) {
-    socket_t to_fd = (cli->cli_socket == fd) ? cli->des_socket : cli->cli_socket;
-    ssize_t size = packet_size, x = 1;
-    for (; size == packet_size && x > 0;) {
-        size = recv(fd, buffer, size, 0);
-        for (ssize_t snd = 0; snd < size && (x = send(to_fd, buffer + snd, size - snd, 0)) > 0; snd += x);
-    }
-    return (size < x) ? size : x;
-}
 
 void *do_server(void *arg) {
-    struct proxy_server *server = arg;
-    struct epoll_event ev;
-    struct proxy_client *cli;
-    socket_t nfds, cli_socket, des_socket;
+    proxy_server *srv = arg;
 
-    server_open(server);
-    while (running && server->socket != -1) {
-        nfds = epoll_wait(server->epoll, &ev, 1, -1);
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == -1) return NULL;
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    fcntl(fds[1], F_SETFL, O_NONBLOCK);
+
+
+    srv->epoll = epoll_create(1);
+    srv->socket = socket(srv->ai_family, srv->ai_socktype, srv->ai_protocol);
+
+    if (srv->socket == -1) return NULL;
+
+
+    const int option = 1;
+    setsockopt(srv->socket, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+
+
+    struct sockaddr_in proxy_addr = {0};
+    proxy_addr.sin_family = srv->ai_family;
+    proxy_addr.sin_addr.s_addr = srv->ai_interface;
+    proxy_addr.sin_port = htons(srv->port);
+
+
+    if (bind(srv->socket, (struct sockaddr *) &proxy_addr, sizeof(proxy_addr)) != 0) goto end;
+    if (srv->ai_protocol == IPPROTO_TCP && listen(srv->socket, 128) != 0) goto end;
+
+
+    struct epoll_event ev = {EPOLLIN, {.fd = srv->socket}};
+    if (epoll_ctl(srv->epoll, EPOLL_CTL_ADD, srv->socket, &ev) != 0) goto end;
+
+
+    while (1) {
+        const int32_t nfds = epoll_wait(srv->epoll, &ev, 1, -1);
         if (nfds <= 0) continue;
 
-        if (ev.data.fd == server->socket) {
-            cli_socket = accept(server->socket, NULL, NULL);
-            des_socket = destination_socket(server);
+        if (ev.data.fd == srv->socket) {
+            const int32_t cli_socket = accept(srv->socket, NULL, NULL);
+            const int32_t des_socket = destination_socket(srv);
+            printf("PORT %d : %d %d\n", srv->port, cli_socket, des_socket);
 
-            if (cli_socket == -1 || des_socket == -1) {
-                if (cli_socket != -1) close(cli_socket);
-                if (des_socket != -1) close(des_socket);
-                continue;
-            }
+            if (cli_socket == -1 || des_socket == -1) goto bad_cli;
 
             ev = (struct epoll_event) {EPOLLIN, {.fd = cli_socket}};
-            epoll_ctl(server->epoll, EPOLL_CTL_ADD, cli_socket, &ev);
+            if (epoll_ctl(srv->epoll, EPOLL_CTL_ADD, cli_socket, &ev) == -1) goto bad_cli;
+
             ev = (struct epoll_event) {EPOLLIN, {.fd = des_socket}};
-            epoll_ctl(server->epoll, EPOLL_CTL_ADD, des_socket, &ev);
+            if (epoll_ctl(srv->epoll, EPOLL_CTL_ADD, des_socket, &ev) == -1) goto bad_cli;
 
-            proxy_clients_add(&server->clients, new_client(cli_socket, des_socket));
+            proxy_clients_add(&srv->clients, cli_socket, des_socket);
+            continue;
+bad_cli:
+            if (cli_socket != -1) close(cli_socket);
+            if (des_socket != -1) close(des_socket);
         } else {
-            cli = proxy_clients_find(&server->clients, ev.data.fd);
-            if (cli == NULL || do_client(cli, ev.data.fd) != 0) continue;
+            proxy_client *cli = proxy_clients_find(&srv->clients, ev.data.fd);
+            if (cli == NULL) continue;
 
-            epoll_ctl(server->epoll, EPOLL_CTL_DEL, cli->cli_socket, NULL);
-            epoll_ctl(server->epoll, EPOLL_CTL_DEL, cli->des_socket, NULL);
-            proxy_clients_rem(&server->clients, cli);
+            const int32_t fd_t = ev.data.fd;
+            const int32_t fd_f = cli->cli_s == ev.data.fd? cli->des_s : cli->cli_s;
+
+            if (splice(fd_t, NULL, fds[1], NULL, MAX_PACKET, SPLICE_F_MOVE | SPLICE_F_NONBLOCK) > 0 &&
+                splice(fds[0], NULL, fd_f, NULL, MAX_PACKET, SPLICE_F_MOVE | SPLICE_F_NONBLOCK) > 0)
+                continue;
+
+            epoll_ctl(srv->epoll, EPOLL_CTL_DEL, cli->cli_s, NULL);
+            epoll_ctl(srv->epoll, EPOLL_CTL_DEL, cli->des_s, NULL);
+
+            proxy_clients_rem(&srv->clients, cli);
         }
     }
+end:
+    printf("ERR PORT : %d\n", srv->port);
+
+    close(srv->socket);
     return NULL;
 }
 
 
-struct proxy_server *parse_server(config_setting_t *proxy) {
-    struct proxy_server *serv = calloc(1, sizeof(*serv));
-    memset(serv, 0, sizeof(*serv));
-    serv->socket = -1;
-    serv->epoll = -1;
 
-    serv->config.domain = AF_INET;
-    serv->config.service = SOCK_STREAM;
-    serv->config.protocol = IPPROTO_TCP;
-    serv->config.interface = INADDR_ANY; // 0.0.0.0
+void parse_config(proxy_server *srv, const config_setting_t *config) {
+    config_setting_lookup_int(config, "domain", &srv->ai_family);
+    config_setting_lookup_int(config, "service", &srv->ai_socktype);
+    config_setting_lookup_int(config, "protocol", &srv->ai_protocol);
+    config_setting_lookup_int(config, "interface", &srv->ai_interface);
+    config_setting_lookup_int(config, "port", &srv->port);
 
-    config_setting_lookup_int(proxy, "domain", &serv->config.domain);
-    config_setting_lookup_int(proxy, "service", &serv->config.service);
-    config_setting_lookup_int(proxy, "protocol", &serv->config.protocol);
-    config_setting_lookup_int(proxy, "interface", &serv->config.interface);
-    config_setting_lookup_int(proxy, "port", &serv->config.port);
+    const config_setting_t *destination = config_setting_lookup(config, "destination");
 
-    config_setting_t *destination = config_setting_lookup(proxy, "destination");
-    config_setting_lookup_string(destination, "address", &serv->config.dest_server);
-    config_setting_lookup_int(destination, "port", &serv->config.dest_port);
-    return serv;
+    config_setting_lookup_string(destination, "address", &srv->des_server);
+    config_setting_lookup_int(destination, "port", &srv->des_port);
 }
 
-void start_new_server(struct list_threads *threads, struct proxy_server *serv) {
-    struct list_threads_elm *elm = malloc(sizeof(*elm));
-    *elm = (struct list_threads_elm){0, serv, NULL};
-    pthread_create(&elm->thread, NULL, do_server, serv);
+void start_new_server(servers_list *servers, const config_setting_t *config) {
+    proxy_server *srv = malloc(sizeof(proxy_server));
+    *srv = (proxy_server) {{NULL, NULL}, -1, -1, AF_INET, SOCK_STREAM, IPPROTO_TCP, INADDR_ANY};
 
-    if (threads->first == NULL) threads->first = elm;
-    else threads->last->next = elm;
-    threads->last = elm;
+    parse_config(srv, config);
+    pthread_create(&srv->thread, NULL, do_server, srv);
+
+    if (servers->head == NULL) servers->head = srv;
+    else servers->last->next = srv;
+    servers->last = srv;
 }
 
-void join_thread_list(struct list_threads *threads) {
-    for (struct list_threads_elm *elm = threads->first, *next; elm != NULL; ) {
-        pthread_join(elm->thread, NULL);
-        next = elm->next;
-        free(elm->serv);
-        free(elm);
-        elm = next;
+void join_thread_list(const servers_list *servers) {
+    for (proxy_server *srv = servers->head, *next; srv != NULL; srv = next) {
+        pthread_join(srv->thread, NULL);
+
+        next = srv->next;
+        free(srv);
     }
 }
 
-int main(int argc, char **argv) {
-    parse_args(argc - 1, argv + 1);
-
-    struct list_threads threads = {NULL};
-    config_setting_t *setting, *proxy;
+int32_t main(int32_t argc, char **argv) {
+    servers_list servers = {NULL, NULL};
     config_t cfg;
 
     config_init(&cfg);
     if (!config_read_file(&cfg, config_file)) {
-        fprintf(stderr, "%s:%d - %s\n", config_error_file(&cfg),
-                config_error_line(&cfg), config_error_text(&cfg));
+        fprintf(stderr, "%s:%d - %s\n", config_error_file(&cfg), config_error_line(&cfg), config_error_text(&cfg));
         config_destroy(&cfg);
-        return (EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    setting = config_lookup(&cfg, "proxy_servers");
-    int count = config_setting_length(setting);
+    const config_setting_t *setting = config_lookup(&cfg, "proxy_servers");
+    const int32_t count = config_setting_length(setting);
     printf("Length : %d\n", count);
 
     for (int i = 0; i < count; i++)
-        start_new_server(&threads, parse_server(config_setting_get_elem(setting, i)));
-    join_thread_list(&threads);
-}
+        start_new_server(&servers, config_setting_get_elem(setting, i));
 
+    join_thread_list(&servers);
+    config_destroy(&cfg);
+}
