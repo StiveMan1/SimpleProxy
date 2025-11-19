@@ -12,7 +12,7 @@ This is a simple, no-nonsense TCP proxy server that you can fire up in seconds. 
 ├── config.h                  # Where the struct magic lives
 ├── install.sh                # Just run it and relax
 ├── main.c                    # The brains of the proxy
-└── simple-porxy.service      # systemd service (yeah, typo included 🙃)
+└── simple-proxy.service      # systemd service (yeah, typo included 🙃)
 ```
 
 ## 🚀 Getting Started
@@ -66,7 +66,7 @@ This proxy:
 
 ## 📦 What’s With the Name?
 
-You’ll notice the simple-porxy.service file has a typo.
+You’ll notice the simple-proxy.service file has a typo.
 Yes, we kept it — just in case someone accidentally used it. You're welcome.
 
 ## 🧹 Uninstall?
