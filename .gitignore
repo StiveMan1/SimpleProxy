@@ -11,8 +11,6 @@ config.cfg
 
 # Systemd Service file (this will be copied to /etc/systemd/system,
 # so the one in the repo is just a template/source)
-simple-proxy.service
-simple-porxy.service # Include the typo version just in case it lingers
 
 # Logs
 *.log
