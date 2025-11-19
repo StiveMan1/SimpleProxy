@@ -1,5 +1,6 @@
-#include <errno.h>
+#define _GNU_SOURCE
 
+#include <errno.h>
 #include "libconfig.h"
 
 #include <sys/socket.h>
@@ -201,20 +202,20 @@ end:
 
 
 
-void parse_config(proxy_server *srv, const config_setting_t *config) {
+void parse_config(proxy_server *srv, config_setting_t *config) {
     config_setting_lookup_int(config, "domain", &srv->ai_family);
     config_setting_lookup_int(config, "service", &srv->ai_socktype);
     config_setting_lookup_int(config, "protocol", &srv->ai_protocol);
     config_setting_lookup_int(config, "interface", &srv->ai_interface);
     config_setting_lookup_int(config, "port", &srv->port);
 
-    const config_setting_t *destination = config_setting_lookup(config, "destination");
+    config_setting_t *destination = config_setting_lookup(config, "destination");
 
     config_setting_lookup_string(destination, "address", &srv->des_server);
     config_setting_lookup_int(destination, "port", &srv->des_port);
 }
 
-void start_new_server(servers_list *servers, const config_setting_t *config) {
+void start_new_server(servers_list *servers, config_setting_t *config) {
     proxy_server *srv = malloc(sizeof(proxy_server));
     *srv = (proxy_server) {{NULL, NULL}, -1, -1, AF_INET, SOCK_STREAM, IPPROTO_TCP, INADDR_ANY};
 
@@ -246,7 +247,7 @@ int32_t main(int32_t argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    const config_setting_t *setting = config_lookup(&cfg, "proxy_servers");
+    config_setting_t *setting = config_lookup(&cfg, "proxy_servers");
     const int32_t count = config_setting_length(setting);
     printf("Length : %d\n", count);
 
